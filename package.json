@@ -1,14 +1,22 @@
 {
   "name": "geturanium_bot",
   "version": "1.0.0",
-  "main": "bot.mjs",
-  "type": "module",
+  "description": "",
+  "main": "bot.cjs",
   "scripts": {
-    "start": "node bot.mjs"
+    "start": "node bot.cjs",
+    "start:headless": "cross-env HEADLESS=true node bot.cjs",
+    "start:gui": "cross-env HEADLESS=false node bot.cjs"
   },
+  "keywords": [],
+  "author": "k2wGG",
+  "license": "ISC",
   "dependencies": {
-    "puppeteer": "^24.10.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer": "^22.0.0",
+    "puppeteer-extra": "^11.0.0",
+    "puppeteer-extra-plugin-stealth": "^2.11.0"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3"
   }
 }

@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "autoAC": true,
+  "autoSM": true,
+  "autoCB": true,
+  "autoFarm": true,
+  "autoRefine": true,
+  "keepAlive": true,
+  "autoReload": true,
+  "reloadMinutes": 50,
+  "logEach": 2,
+  "headless": false,
+  "slowMo": 0,
+  "cookiesFilePath": "./cookies.json",
+  "configFilePath": "./config.json",
+  "statsFilePath": "./stats.json",
+  "backoffUntil": 0
+}
