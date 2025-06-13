@@ -117,6 +117,7 @@ async function launch() {
         '--disable-notifications', // Для подавления уведомлений
         '--disable-popup-blocking', // Для подавления всплывающих окон
         '--ignore-certificate-errors', // Игнорировать ошибки сертификатов
+        '--disable-notifications',
       ]
     });
     page = await browser.newPage();
@@ -610,7 +611,7 @@ async function mainLoop() {
     // 4) Периодическое сохранение cookies
     if (Date.now() - lastCookieSave > 5 * 60 * 1000) {
       try {
-        const cookiesToSave = await page.browser().defaultBrowserContext().cookies();
+        const cookiesToSave = await page.cookies();
         await save(config.cookiesFilePath, cookiesToSave);
         log(`💾 Cookies сохранены (${cookiesToSave.length})`, 'info');
         lastCookieSave = Date.now();
@@ -658,12 +659,13 @@ async function mainLoop() {
         .catch(e => log(`⌛ Тайм-аут ожидания авторизации: ${e.message}`, 'warn'));
       navigating = false;
       log('✅ Авторизация завершена', 'info');
-      const cook = await page.browser().defaultBrowserContext().cookies();
+      const cook = await page.cookies();
       await save(config.cookiesFilePath, cook);
       lastCookieSave = Date.now();
+
     } else {
       log('ℹ️ Сессия активна, сохраняем текущие куки', 'info');
-      const cook = await page.browser().defaultBrowserContext().cookies();
+      const cook = await page.cookies().catch(()=>[]);
       await save(config.cookiesFilePath, cook);
       lastCookieSave = Date.now();
     }
@@ -671,7 +673,7 @@ async function mainLoop() {
     await sleep(3000);
     process.on('SIGINT', async () => {
       log('SIGINT, сохраняем и выходим...', 'info');
-      const cook = await page.browser().defaultBrowserContext().cookies().catch(()=>[]);
+      const cook = await page.cookies().catch(()=>[]);
       await save(config.cookiesFilePath, cook);
       await save(config.configFilePath, config);
       await save(config.statsFilePath, stats);

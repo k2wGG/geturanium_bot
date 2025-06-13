@@ -13,7 +13,7 @@
   "license": "ISC",
   "dependencies": {
     "puppeteer": "^22.0.0",
-    "puppeteer-extra": "^11.0.0",
+    "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.0"
   },
   "devDependencies": {
