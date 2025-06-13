@@ -602,7 +602,7 @@ async function mainLoop() {
       if(Date.now()-lastTS>1800000 && xu > 0){
         log('🛑 XU статичен 30 мин – reload','warn');
         await hardReload();
-        lastTS=Date.Now();
+        lastTS = Date.Now();
       }
     } catch(e) {
       log(`❌ mainLoop: Ошибка проверки XU (вне iframe): ${e.message}`, 'error');
