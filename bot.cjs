@@ -599,8 +599,8 @@ async function mainLoop() {
     try {
       const xu = await page.evaluate(()=>+document.querySelector('span.text-sm.font-medium.text-amber-400.drop-shadow-sm.tracking-wide')?.textContent.replace(/\s/g,'').replace(',','.')||0);
       if(xu!==lastXu){lastXu=xu;lastTS=Date.now();}
-      if(Date.now()-lastTS>300000 && xu > 0){
-        log('🛑 XU статичен 5 мин – reload','warn');
+      if(Date.now()-lastTS>1800000 && xu > 0){
+        log('🛑 XU статичен 30 мин – reload','warn');
         await hardReload();
         lastTS=Date.Now();
       }
