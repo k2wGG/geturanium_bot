@@ -1,6 +1,6 @@
 {
   "name": "geturanium_bot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "",
   "main": "bot.cjs",
   "scripts": {
@@ -10,7 +10,7 @@
   },
   "keywords": [],
   "author": "k2wGG",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "puppeteer": "^22.0.0",
     "puppeteer-extra": "^3.3.6",
