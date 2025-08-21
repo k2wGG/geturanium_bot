@@ -95,7 +95,7 @@ function normalizeProxy(p) {
 /* ===== 3. Логгер =================================== */
 const COLOR = { info:34, warn:33, error:31, debug:36, success:32 };
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
-const MIN_LOG_LEVEL_INDEX = 0;
+const MIN_LOG_LEVEL_INDEX = 1;
 
 function log(msg, level='info') {
   const levelIndex = LOG_LEVELS.indexOf(level);
@@ -587,8 +587,8 @@ function recomputeNextRefineryVisit() {
     // ранний заход за ~90 сек до конца окна
     nextRefineryVisitAt = last + EIGHT_HOURS - 90*1000;
   }
-  // но не чаще, чем раз в 5 минут даже при ошибках
-  const minNext = Date.now() + 5*60*1000;
+  // но не чаще, чем раз в 3 часа даже при ошибках
+  const minNext = Date.now() + 3*60*60*1000;
   if (nextRefineryVisitAt < minNext && last) nextRefineryVisitAt = minNext;
   log(`📅 Следующий визит на /refinery ≈ ${new Date(nextRefineryVisitAt).toLocaleTimeString()}`, 'info');
 }
@@ -623,7 +623,6 @@ async function mainLoop() {
 
     // ======= Плановый визит на /refinery (НЕ прыгаем без надобности) =======
     if (now >= (nextRefineryVisitAt || 0)) {
-      log('↪️ Переходим на /refinery ...', 'info');
       await gotoIfNeeded('https://www.geturanium.io/refinery', '/refinery');
 
       let r;
