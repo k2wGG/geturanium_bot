@@ -3,27 +3,32 @@
   "autoAC": true,
   "autoSM": true,
   "autoCB": true,
-  "autoFarm": true,
+  "autoFarm": false,
   "autoRefine": true,
+
   "keepAlive": true,
-  "autoReload": false,
-  "refineHours": 8,
+  "autoReload": true,
   "reloadMinutes": 50,
-  "logEach": 60,
-  "headless": true,
-  "slowMo": 55,
-  "cookiesFilePath": "./cookies.json",
-  "configFilePath": "./config.json",
-  "statsFilePath": "./stats.json",
-  "backoffUntil": 0,
-  "showClientLogs": false,
+  "logEach": 300,
+
+  "headless": false,
+  "slowMo": 0,
   "useSystemChrome": true,
   "chromePath": "",
   "acceptLanguage": "en-US,en;q=0.9",
   "timezone": "Europe/Berlin",
+
   "boostIntervalMs": 300000,
   "boostJitterMs": 15000,
-  "proxies": [""],
+
+  "cookiesFilePath": "./cookies.json",
+  "configFilePath": "./config.json",
+  "statsFilePath": "./stats.json",
+
+  "proxies": [],
   "proxyRotation": "perLaunch",
-  "rotateProxyOnReload": true
+  "rotateProxyOnReload": true,
+
+  "refineHours": 8,
+  "refineMinMinutes": 30
 }

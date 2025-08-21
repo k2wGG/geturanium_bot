@@ -19,6 +19,7 @@ const DEF = {
   keepAlive: true,
   autoReload: true, reloadMinutes: 50,
   logEach: 300,         // частота info/debug с клиентской стороны
+  showClientLogs: false, // <— можно выключать инфо/дебаг со стороны страницы
   // Браузер
   headless: false, slowMo: 0,
   useSystemChrome: true, chromePath: '',
@@ -27,6 +28,9 @@ const DEF = {
   // Интервалы бустов (главная)
   boostIntervalMs: 300000,     // 5 минут
   boostJitterMs: 15000,        // ±15с
+  // Рефайнери-расписание
+  refineHours: 8,              // окно между запусками
+  refineMinMinutes: 30,        // минимум между проверками кнопки
   // Пути
   cookiesFilePath: './cookies.json',
   configFilePath: './config.json',
@@ -95,6 +99,7 @@ function normalizeProxy(p) {
 /* ===== 3. Логгер =================================== */
 const COLOR = { info:34, warn:33, error:31, debug:36, success:32 };
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
+// 0=всё, 1=без debug, 2=только warn+error, 3=только error
 const MIN_LOG_LEVEL_INDEX = 1;
 
 function log(msg, level='info') {
@@ -373,11 +378,13 @@ async function runClient(mode) {
 
     const rnd = (min,max)=> (min + Math.random()*(max-min)) | 0;
 
+    // ——— клиентские логи: warn/error всегда, info/debug — только если cfg.showClientLogs === true ———
     const clientLog = (msg, level='info') => {
       const now = Date.now();
+      const allowInfoDebug = cfg.showClientLogs === true;
       if (level === 'error' || level === 'warn') {
         if (window.logFromClient) window.logFromClient(msg, level);
-      } else if (cfg.logEach > 0 && now >= _nextLogValue) {
+      } else if (allowInfoDebug && cfg.logEach > 0 && now >= _nextLogValue) {
         if (window.logFromClient) window.logFromClient(msg, level);
         _nextLogValue = now + cfg.logEach * 1000;
       }
@@ -393,6 +400,25 @@ async function runClient(mode) {
       const y = rect.top  + Math.random() * rect.height;
       if (window.doPuppeteerClick) { await window.doPuppeteerClick(x, y); }
       else { clientLog('[Client WARN] doPuppeteerClick недоступен. Нативный click().', 'warn'); el.click(); }
+    }
+
+    // ——— помощники поиска кнопок/значений для refinery ———
+    function findRefineButton() {
+      const variants = [
+        'initiate uranium refining',
+        'start refining',
+        'begin refining',
+        'refine now',
+        'start conversion',
+        'initiate refining'
+      ];
+      const btns = [...document.querySelectorAll('button')];
+      for (const v of variants) {
+        const needle = v.toLowerCase();
+        const b = btns.find(b => (b.innerText || '').toLowerCase().replace(/\s+/g,' ').includes(needle));
+        if (b) return b;
+      }
+      return null;
     }
 
     function findBtnByText(text){
@@ -413,9 +439,27 @@ async function runClient(mode) {
       return null;
     }
 
+    function readShardNumbers() {
+      let currentPoints = 0, requiredPoints = 0;
+      const nodes = [...document.querySelectorAll('span,div,strong,em,p,small')].map(el => ({
+        el, txt: (el.innerText || '').toLowerCase().trim()
+      }));
+      const your = nodes.find(n => /your shards|available shards|your balance|available balance/.test(n.txt));
+      if (your) {
+        const raw = (your.el.nextElementSibling?.innerText || your.el.innerText || '').replace(/[^\d]/g,'');
+        currentPoints = parseInt(raw)||0;
+      }
+      const need = nodes.find(n => /required shards|required input|minimum threshold|required amount/.test(n.txt));
+      if (need) {
+        const raw = (need.el.nextElementSibling?.innerText || need.el.innerText || '').replace(/[^\d]/g,'');
+        requiredPoints = parseInt(raw)||0;
+      }
+      return { currentPoints, requiredPoints };
+    }
+
     function getCooldown(btn){
       if (!btn || btn.disabled === false) return 0;
-      if (/activating|processing/i.test(btn.innerText)) return 3000;
+      if (/activating|processing|starting/i.test(btn.innerText)) return 3000;
       const m = /(\d+)\s*m.*?(\d+)\s*s/i.exec(btn.innerText); if (m) return (+m[1]*60 + +m[2]) * 1000;
       const s = /(\d+)\s*s/i.exec(btn.innerText); return s ? +s[1]*1000 : 600000;
     }
@@ -463,25 +507,8 @@ async function runClient(mode) {
         };
       }
 
-      // кнопка "initiate uranium refining"
-      const btn = findBtnByText('initiate uranium refining');
-
-      // читаем "Available/Your Shards" и "Required"
-      let currentPoints = 0, requiredPoints = 0;
-      try {
-        const shardsEl = [...document.querySelectorAll('span,div')]
-          .find(el => /available shards|your shards/i.test(el.innerText||''));
-        const requiredEl = [...document.querySelectorAll('span,div')]
-          .find(el => /required input|required shards|minimum threshold/i.test(el.innerText||''));
-        if (shardsEl) {
-          const n = (shardsEl.nextElementSibling?.innerText || shardsEl.innerText || '').replace(/[^0-9]/g,'');
-          currentPoints = parseInt(n)||0;
-        }
-        if (requiredEl) {
-          const n = (requiredEl.nextElementSibling?.innerText || requiredEl.innerText || '').replace(/[^0-9]/g,'');
-          requiredPoints = parseInt(n)||0;
-        }
-      } catch {}
+      const btn = findRefineButton();
+      const { currentPoints, requiredPoints } = readShardNumbers();
 
       if (btn && !btn.disabled && currentPoints >= requiredPoints) {
         clientLog('[Refinery] Кликаю «INITIATE URANIUM REFINING».', 'info');
@@ -576,20 +603,27 @@ async function runClient(mode) {
 }
 
 /* ===== 10. Планировщик /refinery ================== */
-const EIGHT_HOURS = 8*60*60*1000;
 function recomputeNextRefineryVisit() {
-  // идти на /refinery только когда подошло окно 8 часов после последнего клика
-  // если ни разу не кликали — посетить сразу
+  // Часы и «минимальная проверка» берём из config.json, есть дефолты на всякий случай
+  const hours = Number(config.refineHours) > 0 ? Number(config.refineHours) : 8;
+  const minMinutes = Number(config.refineMinMinutes) > 0 ? Number(config.refineMinMinutes) : 30;
+
+  const WINDOW_MS = hours * 60 * 60 * 1000;   // окно между нажатиями
+  const MIN_RECHECK_MS  = minMinutes * 60 * 1000; // не дёргать чаще, чем…
+
   const last = lastClick.autoRefine || 0;
+
   if (!last) {
-    nextRefineryVisitAt = Date.now(); // сейчас
+    nextRefineryVisitAt = Date.now();
   } else {
-    // ранний заход за ~90 сек до конца окна
-    nextRefineryVisitAt = last + EIGHT_HOURS - 90*1000;
+    nextRefineryVisitAt = last + WINDOW_MS - 90 * 1000; // запас 90с
   }
-  // но не чаще, чем раз в 3 часа даже при ошибках
-  const minNext = Date.now() + 3*60*60*1000;
-  if (nextRefineryVisitAt < minNext && last) nextRefineryVisitAt = minNext;
+
+  const floor = Date.now() + MIN_RECHECK_MS;
+  if (last && nextRefineryVisitAt < floor) {
+    nextRefineryVisitAt = floor;
+  }
+
   log(`📅 Следующий визит на /refinery ≈ ${new Date(nextRefineryVisitAt).toLocaleTimeString()}`, 'info');
 }
 
@@ -633,9 +667,8 @@ async function mainLoop() {
         r = { action:'no_action', waitDuration: 15000 };
       }
 
-      // Подтверждение клика для /refinery
+      // Подтверждение клика для /refinery (усиленный валидатор)
       if (r.action === 'clicked' && r.which === 'autoRefine') {
-        // ждём до 8с, что кнопка ушла в кд/изменилась
         const ok = await page.evaluate(async () => {
           function findBtn(text){
             const needle = String(text||'').toLowerCase().replace(/\s+/g,' ').trim();
@@ -646,10 +679,20 @@ async function mainLoop() {
             }
             return null;
           }
-          for (let i=0;i<8;i++){
+          function hasActiveStatus() {
+            const txt = (document.body.innerText || '').toLowerCase();
+            return /system status.*active|refining process.*active|converting.*uranium points/i.test(txt);
+          }
+          function hasCompletionTimer() {
+            const txt = (document.body.innerText || '').toLowerCase();
+            return /completion time|time remaining|remaining time/i.test(txt);
+          }
+          for (let i=0;i<10;i++){
             const btn = findBtn('initiate uranium refining');
             if (!btn) return true;
-            if (btn.disabled || /cooldown|processing|active/i.test(btn.innerText||'')) return true;
+            const text = (btn.innerText || '').toLowerCase();
+            if (btn.disabled || /(cooldown|processing|activating|active)/i.test(text)) return true;
+            if (hasActiveStatus() || hasCompletionTimer()) return true;
             await new Promise(res=>setTimeout(res,1000));
           }
           return false;
@@ -659,18 +702,19 @@ async function mainLoop() {
           log('⚡ [Refinery] Клик подтверждён.', 'info');
           lastClick.autoRefine = Date.now();
           stats.clickCount.autoRefine = (stats.clickCount.autoRefine||0) + 1;
-          // планируем следующий визит строго через 8 часов - 90с
           recomputeNextRefineryVisit();
         } else {
           log('⚠️ [Refinery] Клик НЕ подтвердился. Повторим позже.', 'warn');
-          // повторим через 5 минут
-          nextRefineryVisitAt = Date.now() + 5*60*1000;
+          // повтор через минимальный интервал из конфига
+          const minMinutes = Number(config.refineMinMinutes) > 0 ? Number(config.refineMinMinutes) : 30;
+          nextRefineryVisitAt = Date.now() + minMinutes * 60 * 1000;
           log(`📅 Следующий визит на /refinery ≈ ${new Date(nextRefineryVisitAt).toLocaleTimeString()}`, 'info');
         }
       } else {
         log('🐞 [Refinery] Нет действий (ожидание/кд).', 'debug');
-        // если кнопка не доступна — проверим ещё раз через указанную задержку, но не чаще 5 минут
-        const waitMs = Math.max(5*60*1000, (r.waitDuration||30000));
+        // если кнопка не доступна — проверим ещё раз через указанную задержку, но не чаще minMinutes
+        const minMinutes = Number(config.refineMinMinutes) > 0 ? Number(config.refineMinMinutes) : 30;
+        const waitMs = Math.max(minMinutes*60*1000, (r.waitDuration||30000));
         nextRefineryVisitAt = Date.now() + waitMs;
         log(`📅 Следующий визит на /refinery ≈ ${new Date(nextRefineryVisitAt).toLocaleTimeString()}`, 'info');
       }
@@ -724,14 +768,11 @@ async function mainLoop() {
         stats.clickCount[which] = (stats.clickCount[which]||0) + 1;
       } else {
         log(`⚠️ [Boosts] Клик НЕ подтвердился (${which}).`, 'warn');
-        // сбросим локальный таймер, чтобы попробовать снова при следующем окне
         lastClick[which] = 0;
       }
 
-      // после клика — небольшая пауза
       await sleep(rnd(2000, 5000));
     } else {
-      // ничего не сделали — подождём, сколько попросила страница
       const wait = Math.max(1000, Math.min(homeRes.waitDuration||10000, 60000));
       log(`🐞 [Boosts] Нет доступных действий. Пауза ${Math.round(wait/1000)}с.`, 'debug');
       await sleep(wait);
