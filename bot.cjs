@@ -1,47 +1,63 @@
 // bot.cjs
 const fs = require('fs').promises;
 const path = require('path');
-const puppeteer = require('puppeteer-extra'); // <--- Используем puppeteer-extra
-const StealthPlugin = require('puppeteer-extra-plugin-stealth'); // <--- Импортируем StealthPlugin
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
-puppeteer.use(StealthPlugin()); // <--- Применяем StealthPlugin
+puppeteer.use(StealthPlugin());
 
 /* ===== 1. Конфигурация по-умолчанию =================== */
 const DEF = {
-  enabled:true,
-  autoAC:true, autoSM:true, autoCB:true, autoFarm:true, autoRefine:true,
-  keepAlive:true,
-  autoReload:true, reloadMinutes:50,
-  logEach:60, // Логирование в консоль Node.js каждые N секунд (для клиентского логирования).
-  headless:false, // Значение по умолчанию для config.json
-  slowMo:0,
-  cookiesFilePath:'./cookies.json',
-  configFilePath :'./config.json',
-  statsFilePath  :'./stats.json',
-  backoffUntil:0 // Передаем это значение в клиентский скрипт
-  , useSystemChrome:true
-  , chromePath:''
-  , acceptLanguage:'en-US,en;q=0.9'
-  , timezone:'Europe/Berlin'
-  , boostIntervalMs:300000
-  , boostJitterMs:15000
-  , proxies:[]
-  , proxyRotation:'perLaunch'
-  , rotateProxyOnReload:true
+  enabled: true,
+  // Тогглы действий
+  autoAC: true,         // Auto Collector
+  autoSM: true,         // Shard Multiplier
+  autoCB: true,         // Conveyor Booster
+  autoFarm: true,       // (резерв)
+  autoRefine: true,     // Initiate Uranium Refining (раз в 8ч)
+  // Стабильность
+  keepAlive: true,
+  autoReload: true, reloadMinutes: 50,
+  logEach: 300,         // частота info/debug с клиентской стороны
+  // Браузер
+  headless: false, slowMo: 0,
+  useSystemChrome: true, chromePath: '',
+  acceptLanguage: 'en-US,en;q=0.9',
+  timezone: 'Europe/Berlin',
+  // Интервалы бустов (главная)
+  boostIntervalMs: 300000,     // 5 минут
+  boostJitterMs: 15000,        // ±15с
+  // Пути
+  cookiesFilePath: './cookies.json',
+  configFilePath: './config.json',
+  statsFilePath: './stats.json',
+  backoffUntil: 0,
+  // Прокси
+  proxies: [],                 // строки "login:pass@host:port" или "http://login:pass@host:port"
+  proxyRotation: 'perLaunch',  // 'perLaunch' | 'sequential'
+  rotateProxyOnReload: true
 };
 
 /* ===== 2. Состояние ================================= */
 let config = { ...DEF };
-let stats  = { reloadCount:0,
-               clickCount:{autoAC:0,autoSM:0,autoCB:0,autoFarm:0,autoRefine:0}};
-let cookies=[], navigating=false;
+let stats  = {
+  reloadCount: 0,
+  clickCount: { autoAC:0, autoSM:0, autoCB:0, autoFarm:0, autoRefine:0 },
+  lastClick:  { autoAC:0, autoSM:0, autoCB:0, autoFarm:0, autoRefine:0 } // ПЕРСИСТЕНТНО!
+};
+
+let browser, page;
+let navigating = false;
 let lastCookieSave = Date.now();
-let browser, page; // Убрали gameFrame, так как работаем в page
 
-// Для передачи данных из клиента в Node.js
-let clientBackoffUntil = 0; // Теперь это просто Node.js переменная
+// Локальное зеркало lastClick (страница пишет сюда; перед выходом пишем в stats.lastClick)
+let lastClick = { autoAC:0, autoSM:0, autoCB:0, autoFarm:0, autoRefine:0 };
+let clientBackoffUntil = 0;
 
-// === Proxy helpers ===
+// Планировщик для /refinery: когда снова туда идти
+let nextRefineryVisitAt = 0;   // timestamp (ms)
+
+/* ===== Proxy helpers ================================ */
 let __proxyIndex = 0;
 function pickProxy() {
   const list = Array.isArray(config.proxies) ? config.proxies : [];
@@ -49,29 +65,48 @@ function pickProxy() {
   if (config.proxyRotation === 'sequential') {
     const p = list[__proxyIndex % list.length]; __proxyIndex++; return p;
   }
-  // default: perLaunch/random
   return list[Math.floor(Math.random() * list.length)];
 }
 
-/* ===== 3. Логгер =================================== */
-const COLOR = { info: 34, warn: 33, error: 31, debug: 36, success: 32 }; // Добавил success
-// Установите 0 для вывода всех логов (включая debug), 1 для info+, 2 для warn+, 3 для error+
-const MIN_LOG_LEVEL_INDEX = 0; // Временно 0 для полной отладки. После отладки можно изменить на 1 или 2.
-const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
-
-function log(msg, level = 'info') {
-  const levelIndex = LOG_LEVELS.indexOf(level);
-  if (levelIndex < MIN_LOG_LEVEL_INDEX) {
-    return; // Пропускаем логи, если их уровень ниже минимально разрешенного
+/** Нормализация прокси строки.
+ * Принимает: "login:pass@host:port" или "http://login:pass@host:port"
+ * Возвращает: { serverArg: "http://host:port", auth: {username, password} } либо null
+ */
+function normalizeProxy(p) {
+  try {
+    if (!p) return null;
+    let s = String(p).trim();
+    if (!/^[a-z]+:\/\//i.test(s)) s = 'http://' + s; // по умолчанию http://
+    const u = new URL(s);
+    const scheme = u.protocol.replace(':','').toLowerCase(); // http/https/socks5
+    const host = u.hostname;
+    const port = u.port;
+    if (!host || !port) return null;
+    const auth = (u.username || u.password) ? {
+      username: decodeURIComponent(u.username),
+      password: decodeURIComponent(u.password)
+    } : null;
+    return { serverArg: `${scheme}://${host}:${port}`, auth };
+  } catch {
+    return null;
   }
+}
 
+/* ===== 3. Логгер =================================== */
+const COLOR = { info:34, warn:33, error:31, debug:36, success:32 };
+const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
+const MIN_LOG_LEVEL_INDEX = 0;
+
+function log(msg, level='info') {
+  const levelIndex = LOG_LEVELS.indexOf(level);
+  if (levelIndex < MIN_LOG_LEVEL_INDEX) return;
   const time = new Date().toLocaleTimeString('ru-RU');
   const prefix = { info:'ℹ️', warn:'⚠️', error:'🚨', debug:'🐞', success:'✅' }[level] || ' ';
   console.log(`\x1b[${COLOR[level]||37}m[${time}] ${prefix} ${msg}\x1b[0m`);
 }
 
 /* ===== 4. Утилиты ================================== */
-const rnd = (min, max) => min + Math.random() * (max - min) | 0; // Исправил название аргументов на min/max
+const rnd   = (min, max) => (min + Math.random() * (max - min)) | 0;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ===== 5. Файловые операции ======================= */
@@ -92,7 +127,6 @@ async function load(file, def) {
 async function save(file, data) {
   await ensureDir(file);
   await fs.writeFile(path.resolve(file), JSON.stringify(data, null, 2), 'utf8');
-  // log(`💾 ${file} сохранен.`, 'debug'); // Избыточный лог, можно отключить
 }
 
 /* ===== 6. Запуск Puppeteer ======================== */
@@ -100,88 +134,74 @@ const PROFILE_DIR = path.resolve(__dirname, 'browser_profile');
 async function launch() {
   if (browser) {
     log('ℹ️ Закрываю старый браузер...', 'info');
-    try {
-      await browser.close();
-    } catch (e) {
-      log(`❌ Ошибка при закрытии браузера: ${e.message}`, 'error');
-    }
+    try { await browser.close(); } catch (e) { log(`❌ Ошибка при закрытии браузера: ${e.message}`, 'error'); }
   }
 
   log('ℹ️ Запуск браузера...', 'info');
   try {
-    // --- ИЗМЕНЕННАЯ ЛОГИКА ДЛЯ HEADLESS РЕЖИМА ---
-    // Если переменная окружения HEADLESS установлена в 'true', используем 'new' (новый headless режим).
-    // Если установлена в 'false', используем false (GUI режим).
-    // В противном случае, используем значение из config.json.
+    // headless режим
     let finalHeadlessMode;
-    if (process.env.HEADLESS === 'true') {
-        finalHeadlessMode = 'new';
-    } else if (process.env.HEADLESS === 'false') {
-        finalHeadlessMode = false;
-    } else {
-        // Если переменная окружения не установлена, используем значение из конфига
-        finalHeadlessMode = config.headless === true ? 'new' : config.headless;
-    }
-
+    if (process.env.HEADLESS === 'true') finalHeadlessMode = 'new';
+    else if (process.env.HEADLESS === 'false') finalHeadlessMode = false;
+    else finalHeadlessMode = config.headless === true ? 'new' : config.headless;
     log(`🐞 Debug: Вычисленное значение headless для Puppeteer: "${finalHeadlessMode}"`, 'debug');
-    // --- КОНЕЦ ИЗМЕНЕННОЙ ЛОГИКИ ---
 
     const launchArgs = [
-'--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--window-size=1920,1080',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-notifications', // Для подавления уведомлений
-        '--disable-popup-blocking', // Для подавления всплывающих окон
-        '--ignore-certificate-errors', // Игнорировать ошибки сертификатов
-      
-];
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--window-size=1920,1080',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-notifications',
+      '--disable-popup-blocking',
+      '--ignore-certificate-errors'
+    ];
 
-const activeProxy = pickProxy();
-if (activeProxy) {
-  launchArgs.push(`--proxy-server=${activeProxy}`);
-}
-
-browser = await puppeteer.launch({
-  headless: finalHeadlessMode,
-  slowMo: config.slowMo,
-  userDataDir: PROFILE_DIR,
-  executablePath: (config.useSystemChrome && (config.chromePath || process.env.CHROME_PATH)) || undefined,
-  args: launchArgs
-});
-
-page = await browser.newPage();
-await page.setViewport({ width:1920, height:1080 });
-// Dynamic UA matching the actual Chromium/Chrome
-const __ua = await browser.userAgent();
-await page.setUserAgent(__ua);
-// Optional Accept-Language and timezone
-if (config.acceptLanguage) {
-  await page.setExtraHTTPHeaders({ 'Accept-Language': config.acceptLanguage });
-}
-if (config.timezone) {
-  try { await page.emulateTimezone(config.timezone); } catch {}
-}
-// If proxy has auth credentials
-if (typeof activeProxy === 'string') {
-  try {
-    const u = new URL(activeProxy);
-    if (u.username || u.password) {
-      await page.authenticate({ username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) });
+    // применяем прокси
+    const rawProxy    = pickProxy();
+    const parsedProxy = normalizeProxy(rawProxy);
+    if (parsedProxy) {
+      launchArgs.push(`--proxy-server=${parsedProxy.serverArg}`);
+      log(`🌐 Proxy: ${parsedProxy.serverArg} ${parsedProxy.auth ? '(with auth)' : ''}`, 'info');
+    } else if (rawProxy) {
+      log(`⚠️ Некорректная строка прокси: "${rawProxy}"`, 'warn');
     }
-  } catch {}
-}
 
+    browser = await puppeteer.launch({
+      headless: finalHeadlessMode,
+      slowMo: config.slowMo,
+      userDataDir: PROFILE_DIR,
+      executablePath: (config.useSystemChrome && (config.chromePath || process.env.CHROME_PATH)) || undefined,
+      args: launchArgs
+    });
 
-    // Здесь не будет слушателей навигации, так как мы управляем navigating вручную
+    page = await browser.newPage();
+    await page.setViewport({ width:1920, height:1080 });
 
+    // User-Agent + язык/таймзона
+    const __ua = await browser.userAgent();
+    await page.setUserAgent(__ua);
+    if (config.acceptLanguage) {
+      await page.setExtraHTTPHeaders({ 'Accept-Language': config.acceptLanguage });
+    }
+    if (config.timezone) {
+      try { await page.emulateTimezone(config.timezone); } catch {}
+    }
+
+    // аутентификация на прокси через логин/пароль
+    if (parsedProxy && parsedProxy.auth) {
+      try {
+        await page.authenticate(parsedProxy.auth);
+        log('🔐 Прокси-аутентификация применена.', 'info');
+      } catch (e) {
+        log(`⚠️ Ошибка page.authenticate: ${e.message}`, 'warn');
+      }
+    }
+
+    // Патчи до любого кода страницы
     await page.evaluateOnNewDocument(() => {
-      // Патчи для isTrusted, requestAnimationFrame, setTimeout/setInterval, hasFocus
       if (!Event.prototype.__ab_trusted) {
-        [Event, MouseEvent, KeyboardEvent, UIEvent].forEach(C=>{
-          Object.defineProperty(C.prototype,'isTrusted',{
-            get(){return true;}, configurable:true
-          });
+        [Event, MouseEvent, KeyboardEvent, UIEvent].forEach(C => {
+          Object.defineProperty(C.prototype, 'isTrusted', { get(){ return true; }, configurable:true });
         });
         Event.prototype.__ab_trusted = true;
       }
@@ -202,17 +222,23 @@ if (typeof activeProxy === 'string') {
       if (!window.__ab_timers_patched) {
         const MIN = 4;
         const oTO = window.setTimeout, oTI = window.setInterval;
-        window.setTimeout = (cb, d=0, ...a) => oTO(cb, Math.max(d,MIN), ...a);
-        window.setInterval= (cb, d=0, ...a) => oTI(cb, Math.max(d,MIN), ...a);
+        window.setTimeout  = (cb, d=0, ...a) => oTO(cb, Math.max(d,MIN), ...a);
+        window.setInterval = (cb, d=0, ...a) => oTI(cb, Math.max(d,MIN), ...a);
         window.__ab_timers_patched = true;
       }
       if (document.hasFocus && !document.hasFocus.__ab_patched) {
-        document.hasFocus = ()=> true;
+        document.hasFocus = () => true;
         document.hasFocus.__ab_patched = true;
+      }
+      // заглушка Notification (устранить "Notification is not defined")
+      if (typeof window.Notification === 'undefined') {
+        window.Notification = function(){};
+        window.Notification.permission = 'default';
+        window.Notification.requestPermission = async ()=>'denied';
       }
     });
 
-    // Expose functions to the main page context
+    // Expose для кликов и логов
     await page.exposeFunction('doPuppeteerClick', async (x,y) => {
       try {
         await page.mouse.move(x,y,{steps:rnd(10,20)});
@@ -220,32 +246,29 @@ if (typeof activeProxy === 'string') {
         await sleep(rnd(40,120));
         await page.mouse.up();
       } catch (e) {
-          if (!e.message.includes('Session closed') && !e.message.includes('Target closed')) {
-              log(`❌ Ошибка doPuppeteerClick: ${e.message}`, 'error');
-          }
+        if (!e.message.includes('Session closed') && !e.message.includes('Target closed')) {
+          log(`❌ Ошибка doPuppeteerClick: ${e.message}`, 'error');
+        }
       }
     });
-    // --- ИСПРАВЛЕНИЕ ДЛЯ ДВОЙНЫХ [Client] ---
     await page.exposeFunction('logFromClient', (msg, lvl='info') => {
       const cleanedMsg = msg.startsWith('[Client] ') ? msg.substring('[Client] '.length) : msg;
       log(`[Client] ${cleanedMsg}`, lvl);
     });
-    // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
   } catch (error) {
     log(`❌ Ошибка при инициализации браузера: ${error.message}`, 'error');
-    throw error; // Бросаем ошибку, чтобы она была поймана в mainLoop
+    throw error;
   }
 }
 
 /* ===== 7. Слушатели =============================== */
 function listeners() {
-  page.on('console', msg => { // Добавляем обработчик console.log со страницы
+  page.on('console', msg => {
     if (msg.text().includes('Unable to preventDefault inside passive event listener invocation.') ||
         msg.text().includes('Touch event suppression') ||
         msg.text().includes('The default unity loader module is not available on this platform') ||
-        msg.text().includes('DevTools listening on')) {
-      return;
-    }
+        msg.text().includes('DevTools listening on')) return;
     log(`[PAGE CONSOLE] ${msg.text()}`, 'debug');
   });
   page.on('pageerror', err => {
@@ -258,57 +281,65 @@ function listeners() {
   });
 }
 
-/* ===== 8. Жёсткая перезагрузка =================== */
+/* ===== 8. Навигация и перезагрузка =================== */
 let reloadTimer = null;
 let consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 5;
 
+async function gotoIfNeeded(url, label='') {
+  const cur = page.url().replace(/\/+$/,'');
+  const dest = url.replace(/\/+$/,'');
+  if (cur === dest) return;
+  log(`↪️ Переходим на ${label || url} ...`, 'info');
+  navigating = true;
+  await page.goto(url, { waitUntil:'networkidle2', timeout:60000 });
+  navigating = false;
+  await sleep(1000 + rnd(250,750));
+}
+
 async function hardReload() {
   log('🚨 Жёсткая перезагрузка...', 'warn');
 
-if (config.rotateProxyOnReload && Array.isArray(config.proxies) && config.proxies.length) {
-  try { if (browser) await browser.close(); } catch {}
-  await launch(); // relaunch with (potentially) a new proxy
-  scheduleReload();
-  return;
-}
+  if (config.rotateProxyOnReload && Array.isArray(config.proxies) && config.proxies.length) {
+    try { if (browser) await browser.close(); } catch {}
+    await launch(); // релонч с возможной новой проксей
+    scheduleReload();
+    return;
+  }
+
   stats.reloadCount++;
   await save(config.statsFilePath, stats);
   clearTimeout(reloadTimer);
-  navigating = true; // Устанавливаем navigating в true перед перезагрузкой
+  navigating = true;
 
-  // Делаем скриншот перед перезагрузкой для отладки
   try {
-      await fs.mkdir('./screenshots', { recursive: true });
-      await page.screenshot({ path: `./screenshots/reload_before_${Date.now()}.png` });
-      log('📸 Скриншот сделан перед перезагрузкой.', 'debug');
+    await fs.mkdir('./screenshots', { recursive: true });
+    await page.screenshot({ path: `./screenshots/reload_before_${Date.now()}.png` });
+    log('📸 Скриншот сделан перед перезагрузкой.', 'debug');
   } catch (e) {
-      log(`❌ Ошибка при создании скриншота перед перезагрузкой: ${e.message}`, 'error');
+    log(`❌ Ошибка при создании скриншота перед перезагрузкой: ${e.message}`, 'error');
   }
 
   try {
     await page.goto('about:blank');
-    await page.goto(`https://geturanium.io/?_=${Date.now()}`, { waitUntil:'networkidle2', timeout:60000 }); // Ждем полной загрузки сети
+    await page.goto(`https://geturanium.io/?_=${Date.now()}`, { waitUntil:'networkidle2', timeout:60000 });
     log(`ℹ️ URL после перезагрузки: ${page.url()}`, 'info');
 
-    // Проверяем, не на странице авторизации ли мы
     if (page.url().includes('/auth')) {
       log('🔑 После перезагрузки оказались на странице авторизации, ждём входа…', 'info');
       await page.waitForNavigation({ waitUntil:'networkidle2', timeout:180000 })
-          .catch(e => log(`⌛ Тайм-аут ожидания авторизации после перезагрузки: ${e.message}`, 'warn'));
+        .catch(e => log(`⌛ Тайм-аут ожидания авторизации после перезагрузки: ${e.message}`, 'warn'));
       log('✅ Авторизация после перезагрузки завершена', 'info');
-      // Сохранение куки уже происходит в конце цикла или при SIGINT
     } else {
       log('✅ После перезагрузки сессия активна.', 'info');
     }
 
   } catch (error) {
     log(`❌ Ошибка при выполнении goto во время hardReload: ${error.message}`, 'error');
-    // Если даже goto не сработало, то нужно полностью перезапустить браузер
-    await launch(); // Перезапускаем браузер
+    await launch();
   }
-  navigating = false; // Сбрасываем navigating после goto
-  await sleep(3000); // Даем странице немного времени устаканиться
+  navigating = false;
+  await sleep(3000);
   scheduleReload();
 }
 function scheduleReload() {
@@ -319,419 +350,467 @@ function scheduleReload() {
   }
 }
 
-/* ===== 9. Основной цикл ========================== */
+/* ===== 9. Скрипты страницы (evaluate) ================== */
+/**
+ * mode: 'refinery' | 'home'
+ * Возвращает: { updatedStats, updatedLastClick, updatedBackoffUntil, updatedNextLogValue, action, which?, waitDuration? }
+ */
+async function runClient(mode) {
+  return await page.evaluate(async (cfg, initialStats, initialLastClick, mode) => {
+    const LABELS = {
+      autoAC:'auto collector',
+      autoSM:'shard multiplier',
+      autoCB:'conveyor booster',
+      autoFarm:'farm reward',
+      autoRefine:'initiate uranium refining'
+    };
+
+    // перенос из Node внутрь страницы
+    let _lastClick    = { ...(window._ab_lastClick || {}), ...initialLastClick };
+    let _stats        = window._ab_stats || initialStats;
+    let _backoffUntil = window._ab_backoffUntil || 0;
+    let _nextLogValue = window._ab_nextLogValue || Date.now();
+
+    const rnd = (min,max)=> (min + Math.random()*(max-min)) | 0;
+
+    const clientLog = (msg, level='info') => {
+      const now = Date.now();
+      if (level === 'error' || level === 'warn') {
+        if (window.logFromClient) window.logFromClient(msg, level);
+      } else if (cfg.logEach > 0 && now >= _nextLogValue) {
+        if (window.logFromClient) window.logFromClient(msg, level);
+        _nextLogValue = now + cfg.logEach * 1000;
+      }
+    };
+
+    async function clientDoClick(el) {
+      if (!el) { clientLog('[Client] Попытка клика по несуществующему элементу.', 'warn'); return; }
+      try { el.scrollIntoView({ block: 'center' }); } catch {}
+      await new Promise(r => setTimeout(r, 150 + Math.random()*250));
+      const rect = el.getBoundingClientRect();
+      if (!rect.width || !rect.height) { clientLog('[Client] Попытка клика по невидимому элементу.', 'warn'); return; }
+      const x = rect.left + Math.random() * rect.width;
+      const y = rect.top  + Math.random() * rect.height;
+      if (window.doPuppeteerClick) { await window.doPuppeteerClick(x, y); }
+      else { clientLog('[Client WARN] doPuppeteerClick недоступен. Нативный click().', 'warn'); el.click(); }
+    }
+
+    function findBtnByText(text){
+      const needle = String(text||'').toLowerCase().replace(/\s+/g,' ').trim();
+      const buttons = [...document.querySelectorAll('button')];
+      for (const btn of buttons) {
+        const t = (btn.innerText||'').toLowerCase().replace(/\s+/g,' ').trim();
+        if (t.includes(needle)) return btn;
+      }
+      const potentials = [...document.querySelectorAll('h1,h2,h3,div,span,p')];
+      for (const el of potentials) {
+        const t = (el.innerText||'').toLowerCase().replace(/\s+/g,' ').trim();
+        if (t.includes(needle)) {
+          const button = el.closest('button') || el.parentElement?.querySelector('button');
+          if (button) return button;
+        }
+      }
+      return null;
+    }
+
+    function getCooldown(btn){
+      if (!btn || btn.disabled === false) return 0;
+      if (/activating|processing/i.test(btn.innerText)) return 3000;
+      const m = /(\d+)\s*m.*?(\d+)\s*s/i.exec(btn.innerText); if (m) return (+m[1]*60 + +m[2]) * 1000;
+      const s = /(\d+)\s*s/i.exec(btn.innerText); return s ? +s[1]*1000 : 600000;
+    }
+
+    // Перехват fetch для 429/403
+    if (!window.__ab_fetch_patched) {
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = async (...args) => {
+        try {
+          const res = await nativeFetch(...args);
+          if (res.status === 429) {
+            _backoffUntil = Date.now() + 5*60*1000;
+            clientLog('[Client] 429 Too Many Requests → пауза 5 мин.', 'warn');
+          }
+          if (res.status === 403) {
+            clientLog('[Client] 403 Forbidden → нужна перезагрузка.', 'warn');
+            return Promise.reject(new Error('403 Forbidden detected.'));
+          }
+          return res;
+        } catch (error) {
+          clientLog('[Client] fetch error: ' + error.message, 'error');
+          throw error;
+        }
+      };
+      window.__ab_fetch_patched = true;
+    }
+
+    const now = Date.now();
+    if (now < _backoffUntil) {
+      clientLog(`[Client] Пауза до ${new Date(_backoffUntil).toLocaleTimeString()}.`);
+      return {
+        updatedStats:_stats, updatedLastClick:_lastClick,
+        updatedBackoffUntil:_backoffUntil, updatedNextLogValue:_nextLogValue,
+        action:'waiting_backoff', waitDuration:_backoffUntil - now
+      };
+    }
+
+    // === РЕФАЙНЕРИ ===
+    if (mode === 'refinery') {
+      if (!cfg.autoRefine) {
+        return {
+          updatedStats:_stats, updatedLastClick:_lastClick,
+          updatedBackoffUntil:_backoffUntil, updatedNextLogValue:_nextLogValue,
+          action:'no_action', waitDuration: 15000 + rnd(0,5000)
+        };
+      }
+
+      // кнопка "initiate uranium refining"
+      const btn = findBtnByText('initiate uranium refining');
+
+      // читаем "Available/Your Shards" и "Required"
+      let currentPoints = 0, requiredPoints = 0;
+      try {
+        const shardsEl = [...document.querySelectorAll('span,div')]
+          .find(el => /available shards|your shards/i.test(el.innerText||''));
+        const requiredEl = [...document.querySelectorAll('span,div')]
+          .find(el => /required input|required shards|minimum threshold/i.test(el.innerText||''));
+        if (shardsEl) {
+          const n = (shardsEl.nextElementSibling?.innerText || shardsEl.innerText || '').replace(/[^0-9]/g,'');
+          currentPoints = parseInt(n)||0;
+        }
+        if (requiredEl) {
+          const n = (requiredEl.nextElementSibling?.innerText || requiredEl.innerText || '').replace(/[^0-9]/g,'');
+          requiredPoints = parseInt(n)||0;
+        }
+      } catch {}
+
+      if (btn && !btn.disabled && currentPoints >= requiredPoints) {
+        clientLog('[Refinery] Кликаю «INITIATE URANIUM REFINING».', 'info');
+        await clientDoClick(btn);
+        _lastClick.autoRefine = now;
+        _stats.clickCount.autoRefine = (_stats.clickCount.autoRefine||0) + 1;
+        return {
+          updatedStats:_stats, updatedLastClick:_lastClick,
+          updatedBackoffUntil:_backoffUntil, updatedNextLogValue:_nextLogValue,
+          action:'clicked', which:'autoRefine', waitDuration: 3000 + rnd(0,1000)
+        };
+      }
+
+      const cd = getCooldown(btn) || 10000;
+      return {
+        updatedStats:_stats, updatedLastClick:_lastClick,
+        updatedBackoffUntil:_backoffUntil, updatedNextLogValue:_nextLogValue,
+        action:'no_action', waitDuration: cd + rnd(500,2000)
+      };
+    }
+
+    // === ГЛАВНАЯ: бусты ===
+    if (mode === 'home') {
+      const BOOST_KEYS = ['autoAC','autoSM','autoCB'];
+      let minWait = Infinity;
+
+      for (const key of BOOST_KEYS) {
+        if (!cfg[key]) continue;
+
+        const btn = (key==='autoAC') ? findBtnByText('auto collector')
+                  : (key==='autoSM') ? findBtnByText('shard multiplier')
+                  : findBtnByText('conveyor booster');
+
+        if (!btn) { minWait = Math.min(minWait, 10000); continue; }
+
+        const cooldown = getCooldown(btn);
+        if (btn.disabled && cooldown > 0) { minWait = Math.min(minWait, cooldown); continue; }
+
+        if (!btn.disabled) {
+          const since   = now - (_lastClick[key] || 0);
+          const base    = (cfg.boostIntervalMs || 300000);
+          const jitter  = (cfg.boostJitterMs  || 15000);
+          const gap     = base + rnd(-jitter, jitter);
+
+          if (since > gap) {
+            clientLog(`[Boosts] Нажимаю ${key}.`, 'info');
+            await clientDoClick(btn);
+            _lastClick[key] = now;
+            _stats.clickCount[key] = (_stats.clickCount[key]||0) + 1;
+            return {
+              updatedStats:_stats, updatedLastClick:_lastClick,
+              updatedBackoffUntil:_backoffUntil, updatedNextLogValue:_nextLogValue,
+              action:'clicked', which:key, waitDuration: 2000 + rnd(0,1500)
+            };
+          } else {
+            minWait = Math.min(minWait, gap - since);
+          }
+        }
+      }
+
+      // keep-alive
+      if (cfg.keepAlive && rnd(0,10) < 2) {
+        fetch('/favicon.ico',{cache:'no-store',mode:'no-cors'}).catch(()=>{});
+        const body = document.body;
+        if (body) {
+          const rect = body.getBoundingClientRect();
+          const x = rect.left + Math.random()*rect.width;
+          const y = rect.top  + Math.random()*rect.height;
+          body.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,clientX:x,clientY:y}));
+          window.scrollBy(0, rnd(-1,1));
+        }
+        document.dispatchEvent(new Event('focus',{bubbles:true}));
+        document.dispatchEvent(new Event('blur',{bubbles:true}));
+        clientLog('[Boosts] Keep-Alive.', 'info');
+      }
+
+      return {
+        updatedStats:_stats, updatedLastClick:_lastClick,
+        updatedBackoffUntil:_backoffUntil, updatedNextLogValue:_nextLogValue,
+        action:'no_action',
+        waitDuration: (minWait===Infinity ? 10000 + rnd(0,5000) : minWait + rnd(500,2000))
+      };
+    }
+
+    // fallback
+    return {
+      updatedStats:_stats, updatedLastClick:_lastClick,
+      updatedBackoffUntil:_backoffUntil, updatedNextLogValue:_nextLogValue,
+      action:'no_action', waitDuration: 10000 + rnd(0,5000)
+    };
+  }, config, stats, lastClick, mode);
+}
+
+/* ===== 10. Планировщик /refinery ================== */
+const EIGHT_HOURS = 8*60*60*1000;
+function recomputeNextRefineryVisit() {
+  // идти на /refinery только когда подошло окно 8 часов после последнего клика
+  // если ни разу не кликали — посетить сразу
+  const last = lastClick.autoRefine || 0;
+  if (!last) {
+    nextRefineryVisitAt = Date.now(); // сейчас
+  } else {
+    // ранний заход за ~90 сек до конца окна
+    nextRefineryVisitAt = last + EIGHT_HOURS - 90*1000;
+  }
+  // но не чаще, чем раз в 5 минут даже при ошибках
+  const minNext = Date.now() + 5*60*1000;
+  if (nextRefineryVisitAt < minNext && last) nextRefineryVisitAt = minNext;
+  log(`📅 Следующий визит на /refinery ≈ ${new Date(nextRefineryVisitAt).toLocaleTimeString()}`, 'info');
+}
+
+/* ===== 11. Основной цикл ========================== */
 async function mainLoop() {
-  let lastXu = 0, lastTS = Date.now();
   let navigationStuckTimer = null;
+  let lastXu = 0, lastTS = Date.now();
 
   log('✅ mainLoop: Запуск основного цикла.', 'success');
+
+  // Стартуем с главной
+  await gotoIfNeeded('https://www.geturanium.io/', 'главную');
 
   while (true) {
     if (navigating) {
       log('mainLoop: Навигация активна, ждем...', 'debug');
       if (!navigationStuckTimer) {
-          navigationStuckTimer = setTimeout(async () => {
-              log('⚠️ mainLoop: Навигация зависла более 15 секунд. Принудительная перезагрузка.', 'warn');
-              await hardReload();
-              navigationStuckTimer = null;
-          }, 15000);
+        navigationStuckTimer = setTimeout(async () => {
+          log('⚠️ mainLoop: Навигация зависла более 15 секунд. Принудительная перезагрузка.', 'warn');
+          await hardReload();
+          navigationStuckTimer = null;
+        }, 15000);
       }
       await sleep(500);
       continue;
     } else {
-        if (navigationStuckTimer) {
-            clearTimeout(navigationStuckTimer);
-            navigationStuckTimer = null;
-        }
+      if (navigationStuckTimer) { clearTimeout(navigationStuckTimer); navigationStuckTimer = null; }
     }
 
-    // 2) Выполнить клиентский скрипт в контексте основной страницы
-    let updatedClientData;
-    try {
-        updatedClientData = await page.evaluate(async (cfg, initialStats) => {
-            const LABELS={
-              autoAC:'auto collector',
-              autoSM:'shard multiplier',
-              autoCB:'conveyor booster',
-              autoFarm:'farm reward',
-              autoRefine:'start refining'
-            };
-            let _lastClick = window._ab_lastClick || {};
-            let _stats = window._ab_stats || initialStats;
-            let _backoffUntil = window._ab_backoffUntil || 0;
-            let _nextLogValue = window._ab_nextLogValue || Date.now();
+    const now = Date.now();
 
-            const rnd = (min,max)=> min + Math.random()*(max-min)|0;
+    // ======= Плановый визит на /refinery (НЕ прыгаем без надобности) =======
+    if (now >= (nextRefineryVisitAt || 0)) {
+      log('↪️ Переходим на /refinery ...', 'info');
+      await gotoIfNeeded('https://www.geturanium.io/refinery', '/refinery');
 
-            // Умный clientLog: логирует warn/error всегда, info/debug по расписанию
-            const clientLog = (msg, level='info') => {
-              const now = Date.now();
-              if (level === 'error' || level === 'warn') {
-                if (window.logFromClient) {
-                  window.logFromClient(msg, level);
-                }
-              } else if (cfg.logEach > 0 && now >= _nextLogValue) {
-                if (window.logFromClient) {
-                  window.logFromClient(msg, level);
-                }
-                _nextLogValue = now + cfg.logEach * 1000;
-              }
-            };
+      let r;
+      try {
+        r = await runClient('refinery');
+      } catch (e) {
+        log(`❌ Ошибка в runClient('refinery'): ${e.message}`, 'error');
+        r = { action:'no_action', waitDuration: 15000 };
+      }
 
-            async function clientDoClick(el) {
-              if (!el) { clientLog('[Client] Попытка клика по несуществующему элементу.', 'warn'); return; }
-              const rect = el.getBoundingClientRect();
-              if (!rect.width || !rect.height) { clientLog('[Client] Попытка клика по невидимому элементу (нулевая ширина/высота).', 'warn'); return; }
-              const x = rect.left + Math.random() * rect.width;
-              const y = rect.top + Math.random() * rect.height;
-              if (window.doPuppeteerClick) { // Проверяем наличие exposed функции
-                await window.doPuppeteerClick(x, y);
-              } else {
-                clientLog(`[Client WARN] doPuppeteerClick не доступен. Попытка нативного клика.`, 'warn');
-                el.click();
-              }
+      // Подтверждение клика для /refinery
+      if (r.action === 'clicked' && r.which === 'autoRefine') {
+        // ждём до 8с, что кнопка ушла в кд/изменилась
+        const ok = await page.evaluate(async () => {
+          function findBtn(text){
+            const needle = String(text||'').toLowerCase().replace(/\s+/g,' ').trim();
+            const buttons = [...document.querySelectorAll('button')];
+            for (const btn of buttons) {
+              const t = (btn.innerText||'').toLowerCase().replace(/\s+/g,' ').trim();
+              if (t.includes(needle)) return btn;
             }
+            return null;
+          }
+          for (let i=0;i<8;i++){
+            const btn = findBtn('initiate uranium refining');
+            if (!btn) return true;
+            if (btn.disabled || /cooldown|processing|active/i.test(btn.innerText||'')) return true;
+            await new Promise(res=>setTimeout(res,1000));
+          }
+          return false;
+        });
 
-            // findBtn: Находит текстовый элемент, затем ищет ближайшую кнопку.
-            function findBtn(text){
-              const normalizedSearchText = text.toLowerCase().trim();
-              const potentialTextElements = [...document.querySelectorAll('h3, div, span, p')].filter(el => {
-                  return el.innerText && el.innerText.toLowerCase().includes(normalizedSearchText);
-              });
-
-              // clientLog(`[Client Debug] Searching for "${text}". Found ${potentialTextElements.length} potential text elements.`, 'debug');
-
-              for (const el of potentialTextElements) {
-                  const elText = el.innerText?.toLowerCase().trim();
-                  if (elText === normalizedSearchText || elText.startsWith(normalizedSearchText + ' ') || elText.startsWith(normalizedSearchText + '\n')) {
-                      const button = el.closest('button');
-                      if (button) {
-                          // clientLog(`[Client Debug] Найден текстовый элемент "${el.innerText.trim()}" и ближайшая кнопка для "${text}".`, 'debug');
-                          return button;
-                      } else {
-                          // Закомментируйте эту строку, так как она вызывает флуд
-                          // clientLog(`[Client Warn] Найден текстовый элемент "${el.innerText.trim()}" для "${text}", но без ближайшей кнопки.`, 'warn');
-                      }
-                  }
-              }
-              // clientLog(`[Client Debug] Не найден соответствующий текстовый элемент для "${text}".`, 'debug');
-              return null;
-            }
-
-
-            function getCooldown(btn){
-              if(!btn || btn.disabled===false) return 0;
-              if(/activating/i.test(btn.innerText)) return 3000;
-              const m = /(\d+)\s*m.*?(\d+)\s*s/i.exec(btn.innerText);if(m)return(+m[1]*60+ +m[2])*1e3;
-              const s = /(\d+)\s*s/i.exec(btn.innerText);return s? +s[1]*1e3:600000;
-            }
-
-            // --- Перехват fetch для 429 / 403 ---
-            if (!window.__ab_fetch_patched) {
-                const nativeFetch = window.fetch.bind(window);
-                window.fetch = async (...args) => {
-                    try {
-                        const res = await nativeFetch(...args);
-                        if (res.status === 429) {
-                            _backoffUntil = Date.now() + 5 * 60 * 1000;
-                            clientLog('[Client] Обнаружен 429 (Too Many Requests) → ставим паузу 5 мин.', 'warn');
-                        }
-                        if (res.status === 403) {
-                            clientLog('[Client] Обнаружен 403 (Forbidden) → требуется перезагрузка.', 'warn');
-                            return Promise.reject(new Error('403 Forbidden detected.'));
-                        }
-                        return res;
-                    } catch (error) {
-                        clientLog('[Client] Ошибка при выполнении fetch запроса: ' + error.message, 'error');
-                        throw error;
-                    }
-                };
-                window.__ab_fetch_patched = true;
-            }
-
-            // --- Основная логика кликов и проверки кнопок ---
-            const now = Date.now();
-            if (now < _backoffUntil) {
-                clientLog(`[Client] В режиме паузы до ${new Date(_backoffUntil).toLocaleTimeString()}.`);
-                return {
-                    updatedStats: _stats,
-                    updatedLastClick: _lastClick,
-                    updatedBackoffUntil: _backoffUntil,
-                    updatedNextLogValue: _nextLogValue,
-                    action: 'waiting_backoff',
-                    waitDuration: _backoffUntil - now // Передаем оставшееся время паузы
-                };
-            }
-
-            let actionTaken = false;
-            let minWaitDuration = Infinity; // Отслеживаем минимальный кулдаун/задержку
-
-            for (const key of Object.keys(LABELS)) {
-                if (!cfg[key]) continue;
-
-                if (key === 'autoFarm') {
-                    const eightHoursMs = 8 * 60 * 60 * 1000;
-                    const nextFarmTime = (_lastClick[key] || 0) + eightHoursMs;
-
-                    if (now < nextFarmTime) {
-                        const remaining = nextFarmTime - now;
-                        clientLog(`⏳ ${LABELS[key]}: следующий сбор через ${Math.round(remaining / 1000 / 60)} мин.`);
-                        minWaitDuration = Math.min(minWaitDuration, remaining); // Обновляем minWaitDuration
-                        continue;
-                    }
-                }
-
-                const btn = findBtn(LABELS[key]);
-                if (!btn) {
-                    continue; // Кнопка не найдена, переходим к следующей
-                }
-
-                const cooldown = getCooldown(btn);
-                // clientLog(`[Client Debug] Кнопка "${LABELS[key]}": найдена, disabled: ${btn.disabled}, кулдаун: ${cooldown / 1000}s.`, 'debug');
-
-                // Логика для autoRefine
-                if (key === 'autoRefine') {
-                    let currentPoints = 0;
-                    let requiredPoints = 0;
-
-                    const yourShardsLabel = [...document.querySelectorAll('span.font-bold')].find(el => el.innerText.includes('Your Shards'));
-                    const requiredShardsLabel = [...document.querySelectorAll('span.font-bold')].find(el => el.innerText.includes('Required Shards'));
-
-                    if (yourShardsLabel && yourShardsLabel.nextElementSibling) {
-                        currentPoints = parseInt(yourShardsLabel.nextElementSibling.innerText.replace(/[^0-9]/g, '')) || 0;
-                        clientLog(`[Client Debug] Refinery: Current Shards: ${currentPoints}`, 'debug');
-                    }
-                    if (requiredShardsLabel && requiredShardsLabel.nextElementSibling) {
-                        requiredPoints = parseInt(requiredShardsLabel.nextElementSibling.innerText.replace(/[^0-9]/g, '')) || 0;
-                        clientLog(`[Client Debug] Refinery: Required Shards: ${requiredPoints}`, 'debug');
-                    }
-
-                    if (btn.disabled && currentPoints < requiredPoints) {
-                        clientLog(`Refinery: Недостаточно шардов. Нужно ${requiredPoints}, у вас ${currentPoints}.`, 'info');
-                        minWaitDuration = Math.min(minWaitDuration, 5000); // Например, 5 секунд
-                        continue;
-                    }
-                    if (currentPoints >= requiredPoints && !btn.disabled) {
-                        const since = now - (_lastClick[key] || 0);
-                        const gap = 5000 + rnd(0, 2000);
-                        if (since > gap) {
-                            clientLog(`Refinery: Кнопка активна, шардов достаточно. Попытка клика.`, 'info');
-                            await clientDoClick(btn);
-                            _lastClick[key] = now;
-                            _stats.clickCount[key]++;
-                            clientLog(`⚡ ${key} кликнут. Шардов: ${currentPoints}, Требуется: ${requiredPoints}.`, 'info');
-                            actionTaken = true;
-                            return { // Возвращаемся сразу после успешного клика
-                                updatedStats: _stats, updatedLastClick: _lastClick,
-                                updatedBackoffUntil: _backoffUntil, updatedNextLogValue: _nextLogValue,
-                                action: 'clicked'
-                            };
-                        } else {
-                            clientLog(`Refinery: Кнопка активна, шардов достаточно, но слишком рано (осталось ${((gap - since) / 1000).toFixed(1)}s).`, 'info');
-                            minWaitDuration = Math.min(minWaitDuration, gap - since);
-                        }
-                    } else {
-                        clientLog(`Refinery: Кнопка "${LABELS[key]}" недоступна или ожидает. Шардов: ${currentPoints}, Требуется: ${requiredPoints}.`, 'info');
-                        minWaitDuration = Math.min(minWaitDuration, cooldown > 0 ? cooldown : 5000); // Используем cooldown или 5 сек по умолчанию
-                        continue;
-                    }
-                }
-
-                // Общая логика для других кнопок (autoAC, autoSM, autoCB)
-                if (btn.disabled && cooldown > 0) {
-                    clientLog(`[Client] Кнопка "${LABELS[key]}" на кулдауне или отключена.`, 'info');
-                    minWaitDuration = Math.min(minWaitDuration, cooldown);
-                    continue; // Кнопка неактивна, переходим к следующей
-                }
-
-                // Если кнопка активна и не disabled, проверяем задержку
-                if (!btn.disabled) {
-                    const since = now - (_lastClick[key] || 0);
-                    const base = (cfg.boostIntervalMs || 300000);
-                    const jitter = (cfg.boostJitterMs || 15000);
-                    const gap = base + rnd(-jitter, jitter); // ~5 минут ± джиттер
-
-                    if (since > gap) {
-                        clientLog(`[Client] Кнопка "${LABELS[key]}" активна и прошло достаточно времени. Попытка клика.`, 'info');
-                        await clientDoClick(btn);
-                        _lastClick[key] = now;
-                        _stats.clickCount[key]++;
-                        clientLog(`⚡ ${LABELS[key]} кликнут.`, 'info');
-                        actionTaken = true;
-                        return { // Возвращаемся сразу после успешного клика
-                            updatedStats: _stats, updatedLastClick: _lastClick,
-                            updatedBackoffUntil: _backoffUntil, updatedNextLogValue: _nextLogValue,
-                            action: 'clicked'
-                        };
-                    } else {
-                        // Кнопка активна, но еще не время кликать
-                        const remaining = gap - since;
-                        clientLog(`[Client] Кнопка "${LABELS[key]}" активна, но слишком рано (осталось ${((remaining) / 1000).toFixed(1)}s).`, 'info');
-                        minWaitDuration = Math.min(minWaitDuration, remaining);
-                    }
-                }
-            }
-
-            // --- Keep-Alive ---
-            if(cfg.keepAlive && rnd(0,10)<2){ // 20% шанс каждый цикл
-              fetch('/favicon.ico',{cache:'no-store',mode:'no-cors'}).catch(()=>{}); // Фоновый запрос
-              const body = document.body;
-              if (body) {
-                const rect = body.getBoundingClientRect();
-                const x = rect.left + Math.random()*rect.width;
-                const y = rect.top  + Math.random()*rect.height;
-                // Имитация движения мыши
-                body.dispatchEvent(new MouseEvent('mousemove', { bubbles:true, clientX:x, clientY:y }));
-                // Имитация скролла
-                window.scrollBy(0, rnd(-1,1));
-              }
-              // Имитация фокуса/блюра
-              document.dispatchEvent(new Event('focus', {bubbles:true}));
-              document.dispatchEvent(new Event('blur', {bubbles:true}));
-              clientLog('ℹ️ Keep-Alive активность выполнена (client-side).');
-            }
-
-            // Сохраняем состояния в глобальный window
-            window._ab_lastClick = _lastClick;
-            window._ab_stats = _stats;
-            window._ab_backoffUntil = _backoffUntil;
-            window._ab_nextLogValue = _nextLogValue;
-
-            // Если никаких кликов не было, возвращаем информацию о минимальной задержке
-            return {
-                updatedStats: _stats,
-                updatedLastClick: _lastClick,
-                updatedBackoffUntil: _backoffUntil,
-                updatedNextLogValue: _nextLogValue,
-                action: 'no_action',
-                // Если minWaitDuration остался Infinity, значит, нет активных кулдаунов,
-                // ждем дефолтное время (например, 10-15 секунд)
-                waitDuration: minWaitDuration === Infinity ? 10000 + rnd(0, 5000) : minWaitDuration + rnd(500, 2000)
-            };
-
-        }, config, stats); // Передаем актуальные config и stats из Node.js
-
-        // Применяем обновления из клиента (result)
-        stats = updatedClientData.updatedStats;
-        clientBackoffUntil = updatedClientData.updatedBackoffUntil;
-        consecutiveErrors = 0; // Сбрасываем счетчик ошибок при успешном выполнении
-
-        // Обработка действия, выполненного клиентом
-        if (updatedClientData.action === 'clicked') {
-            log('mainLoop: Клиент сообщил о клике, короткая пауза.', 'debug');
-            await sleep(rnd(2000, 5000)); // Короткая пауза после клика
-        } else if (updatedClientData.action === 'no_action' || updatedClientData.action === 'waiting_backoff') {
-            // Пауза, основанная на рассчитанной клиентом минимальной задержке
-            const calculatedSleep = Math.max(1000, Math.min(updatedClientData.waitDuration, 60000)); // Максимум 1 минута, минимум 1 секунда
-            log(`mainLoop: Нет действий, пауза на ${Math.round(calculatedSleep / 1000)} сек.`, 'debug');
-            await sleep(calculatedSleep);
+        if (ok) {
+          log('⚡ [Refinery] Клик подтверждён.', 'info');
+          lastClick.autoRefine = Date.now();
+          stats.clickCount.autoRefine = (stats.clickCount.autoRefine||0) + 1;
+          // планируем следующий визит строго через 8 часов - 90с
+          recomputeNextRefineryVisit();
         } else {
-            // В случае, если клиент вернул неизвестное действие (не должно происходить)
-            log(`mainLoop: Неизвестное действие от клиента: ${updatedClientData.action}, пауза 1 сек.`, 'warn');
-            await sleep(1000);
+          log('⚠️ [Refinery] Клик НЕ подтвердился. Повторим позже.', 'warn');
+          // повторим через 5 минут
+          nextRefineryVisitAt = Date.now() + 5*60*1000;
+          log(`📅 Следующий визит на /refinery ≈ ${new Date(nextRefineryVisitAt).toLocaleTimeString()}`, 'info');
         }
+      } else {
+        log('🐞 [Refinery] Нет действий (ожидание/кд).', 'debug');
+        // если кнопка не доступна — проверим ещё раз через указанную задержку, но не чаще 5 минут
+        const waitMs = Math.max(5*60*1000, (r.waitDuration||30000));
+        nextRefineryVisitAt = Date.now() + waitMs;
+        log(`📅 Следующий визит на /refinery ≈ ${new Date(nextRefineryVisitAt).toLocaleTimeString()}`, 'info');
+      }
 
+      // Возвращаемся на главную и продолжаем кликать бусты
+      await gotoIfNeeded('https://www.geturanium.io/', 'главную');
+
+      // небольшой отдых
+      await sleep(1500);
+    }
+
+    // ======= Бусты на главной (без навигации) =======
+    let homeRes;
+    try {
+      homeRes = await runClient('home');
     } catch (e) {
-        log(`❌ mainLoop: Ошибка при выполнении клиентского скрипта (main page): ${e.message}`, 'error');
-        consecutiveErrors++; // Увеличиваем счетчик ошибок
-
-        if (e.message.includes('403 Forbidden detected') || e.message.includes('ERR_CONNECTION_REFUSED')) {
-            log('❌ Обнаружен 403 / Отказ соединения. Выполняю жесткую перезагрузку.', 'error');
-            await hardReload();
-            consecutiveErrors = 0; // Сброс после жесткой перезагрузки
-        } else if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-            log(`❌ Достигнуто ${MAX_CONSECUTIVE_ERRORS} последовательных ошибок. Выполняю жесткую перезагрузку.`, 'error');
-            await hardReload();
-            consecutiveErrors = 0; // Сбрасываем счетчик после перезагрузки
-        } else {
-            // Если это другая критическая ошибка, просто ждем и повторяем
-            log('❌ Не критическая ошибка. Ждем 5 секунд и повторяем.', 'warn');
-            await sleep(5000); // Короткая пауза при ошибке, чтобы не спамить
-        }
+      log(`❌ Ошибка в runClient('home'): ${e.message}`, 'error');
+      homeRes = { action:'no_action', waitDuration: 10000 };
     }
 
-    // 3) Проверка XU вне iframe - эта часть остается как есть
+    // Подтверждение клика для бустов
+    if (homeRes.action === 'clicked' && homeRes.which) {
+      const which = homeRes.which; // autoAC / autoSM / autoCB
+      const ok = await page.evaluate(async (which) => {
+        function findBtnByKey(k){
+          const map = {
+            autoAC: 'auto collector',
+            autoSM: 'shard multiplier',
+            autoCB: 'conveyor booster'
+          };
+          const needle = map[k];
+          const buttons = [...document.querySelectorAll('button')];
+          for (const btn of buttons) {
+            const t = (btn.innerText||'').toLowerCase().replace(/\s+/g,' ').trim();
+            if (t.includes(needle)) return btn;
+          }
+          return null;
+        }
+        for (let i=0;i<6;i++){
+          const btn = findBtnByKey(which);
+          if (!btn) return true;
+          if (btn.disabled || /cooldown|processing|active/i.test(btn.innerText||'')) return true;
+          await new Promise(res=>setTimeout(res,1000));
+        }
+        return false;
+      }, which);
+
+      if (ok) {
+        log(`⚡ [Boosts] Клик подтверждён (${which}).`, 'info');
+        lastClick[which] = Date.now();
+        stats.clickCount[which] = (stats.clickCount[which]||0) + 1;
+      } else {
+        log(`⚠️ [Boosts] Клик НЕ подтвердился (${which}).`, 'warn');
+        // сбросим локальный таймер, чтобы попробовать снова при следующем окне
+        lastClick[which] = 0;
+      }
+
+      // после клика — небольшая пауза
+      await sleep(rnd(2000, 5000));
+    } else {
+      // ничего не сделали — подождём, сколько попросила страница
+      const wait = Math.max(1000, Math.min(homeRes.waitDuration||10000, 60000));
+      log(`🐞 [Boosts] Нет доступных действий. Пауза ${Math.round(wait/1000)}с.`, 'debug');
+      await sleep(wait);
+    }
+
+    // ======= Сервисные вещи =======
+    // Проверка XU
     try {
-      const xu = await page.evaluate(()=>+document.querySelector('span.text-sm.font-medium.text-amber-400.drop-shadow-sm.tracking-wide')?.textContent.replace(/\s/g,'').replace(',','.')||0);
-      if(xu!==lastXu){lastXu=xu;lastTS=Date.now();}
-      if(Date.now()-lastTS>18000000 && xu > 0){
-        log('🛑 XU статичен 50 мин – reload','warn');
+      const xu = await page.evaluate(() =>
+        +document.querySelector('span.text-sm.font-medium.text-amber-400.drop-shadow-sm.tracking-wide')
+          ?.textContent.replace(/\s/g,'').replace(',','.') || 0
+      );
+      if (xu !== lastXu) { lastXu = xu; lastTS = Date.now(); }
+      if (Date.now() - lastTS > 50*60*1000 && xu > 0) {
+        log('🛑 XU статичен 50 мин – reload', 'warn');
         await hardReload();
-        lastTS = Date.Now();
+        lastTS = Date.now();
       }
     } catch(e) {
-      log(`❌ mainLoop: Ошибка проверки XU (вне iframe): ${e.message}`, 'error');
+      log(`❌ mainLoop: Ошибка проверки XU: ${e.message}`, 'error');
     }
 
-    // 4) Периодическое сохранение cookies
-    if (Date.now() - lastCookieSave > 5 * 60 * 1000) {
+    // Периодическое сохранение cookies
+    if (Date.now() - lastCookieSave > 5*60*1000) {
       try {
         const cookiesToSave = await page.cookies();
         await save(config.cookiesFilePath, cookiesToSave);
         log(`💾 Cookies сохранены (${cookiesToSave.length})`, 'info');
         lastCookieSave = Date.now();
       } catch (e) {
-        log(`❌ mainLoop: Ошибка при периодическом сохранении куки: ${e.message}`, 'error');
+        log(`❌ mainLoop: Ошибка сохранения куки: ${e.message}`, 'error');
       }
     }
 
-    // 5) Сохраняем stats на диск
+    // Сохраняем stats + lastClick
+    stats.lastClick = { ...lastClick };
     await save(config.statsFilePath, stats);
-
-    // Удален sleep(1000) здесь, так как он заменен динамической паузой выше
   }
 }
 
-/* ===== 10. Запуск всего ========================== */
+/* ===== 12. Запуск всего ========================== */
 (async () => {
   process.on('unhandledRejection', (reason, promise) => {
-      log(`🚨 Unhandled Rejection at: ${promise}, reason: ${reason}`, 'error');
-      if (browser) {
-          browser.close().catch(e => log(`❌ Ошибка при закрытии браузера из unhandledRejection: ${e.message}`, 'error'));
-      }
-      process.exit(1);
+    log(`🚨 Unhandled Rejection at: ${promise}, reason: ${reason}`, 'error');
+    if (browser) {
+      browser.close().catch(e => log(`❌ Ошибка при закрытии браузера из unhandledRejection: ${e.message}`, 'error'));
+    }
+    process.exit(1);
   });
 
   log('ℹ️ Загрузка конфига/статистики...', 'info');
-  config = {...DEF, ...(await load(DEF.configFilePath, {}))};
-  stats  = {...stats, ...(await load(DEF.statsFilePath, {}))};
+  config = { ...DEF, ...(await load(DEF.configFilePath, {})) };
 
-  log('ℹ️ Запуск браузера...', 'info');
+  // Грузим stats (включая lastClick, если уже был сохранён ранее)
+  const loadedStats = await load(DEF.statsFilePath, {});
+  stats = { ...stats, ...loadedStats };
+  if (!stats.lastClick) stats.lastClick = { autoAC:0, autoSM:0, autoCB:0, autoFarm:0, autoRefine:0 };
+  lastClick = { ...stats.lastClick };
+
   try {
     await launch();
     listeners();
 
-    log('ℹ️ Переходим на geturanium.io...', 'info');
-    navigating = true;
-    await page.goto('https://geturanium.io', { waitUntil:'networkidle2', timeout:60000 });
-    navigating = false;
-    log(`ℹ️ URL: ${page.url()}`, 'info');
+    // первичный расчёт планировщика /refinery
+    recomputeNextRefineryVisit();
 
-    if (page.url().includes('/auth')) {
-      log('🔑 На странице авторизации, ждём входа…', 'info');
-      navigating = true;
-      await page.waitForNavigation({ waitUntil:'networkidle2', timeout:180000 })
-        .catch(e => log(`⌛ Тайм-аут ожидания авторизации: ${e.message}`, 'warn'));
-      navigating = false;
-      log('✅ Авторизация завершена', 'info');
-      const cook = await page.cookies();
-      await save(config.cookiesFilePath, cook);
-      lastCookieSave = Date.now();
-
-    } else {
-      log('ℹ️ Сессия активна, сохраняем текущие куки', 'info');
-      const cook = await page.cookies().catch(()=>[]);
-      await save(config.cookiesFilePath, cook);
-      lastCookieSave = Date.now();
-    }
-
-    await sleep(3000);
+    // старт обработчика SIGINT
     process.on('SIGINT', async () => {
       log('SIGINT, сохраняем и выходим...', 'info');
-      const cook = await page.cookies().catch(()=>[]);
-      await save(config.cookiesFilePath, cook);
-      await save(config.configFilePath, config);
-      await save(config.statsFilePath, stats);
+      try {
+        const cook = await page.cookies().catch(()=>[]);
+        await save(config.cookiesFilePath, cook);
+        stats.lastClick = { ...lastClick };
+        await save(config.configFilePath, config);
+        await save(config.statsFilePath, stats);
+      } catch (e) {
+        log(`⚠️ Ошибка сохранения при выходе: ${e.message}`, 'warn');
+      }
       if (browser) await browser.close();
       process.exit(0);
     });
