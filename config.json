@@ -7,6 +7,7 @@
   "autoRefine": true,
   "keepAlive": true,
   "autoReload": false,
+  "refineHours": 8,
   "reloadMinutes": 50,
   "logEach": 60,
   "headless": true,
@@ -22,7 +23,7 @@
   "timezone": "Europe/Berlin",
   "boostIntervalMs": 300000,
   "boostJitterMs": 15000,
-  "proxies": [],
+  "proxies": [""],
   "proxyRotation": "perLaunch",
   "rotateProxyOnReload": true
 }
