@@ -19,6 +19,15 @@ const DEF = {
   configFilePath :'./config.json',
   statsFilePath  :'./stats.json',
   backoffUntil:0 // Передаем это значение в клиентский скрипт
+  , useSystemChrome:true
+  , chromePath:''
+  , acceptLanguage:'en-US,en;q=0.9'
+  , timezone:'Europe/Berlin'
+  , boostIntervalMs:300000
+  , boostJitterMs:15000
+  , proxies:[]
+  , proxyRotation:'perLaunch'
+  , rotateProxyOnReload:true
 };
 
 /* ===== 2. Состояние ================================= */
@@ -31,6 +40,18 @@ let browser, page; // Убрали gameFrame, так как работаем в 
 
 // Для передачи данных из клиента в Node.js
 let clientBackoffUntil = 0; // Теперь это просто Node.js переменная
+
+// === Proxy helpers ===
+let __proxyIndex = 0;
+function pickProxy() {
+  const list = Array.isArray(config.proxies) ? config.proxies : [];
+  if (!list.length) return null;
+  if (config.proxyRotation === 'sequential') {
+    const p = list[__proxyIndex % list.length]; __proxyIndex++; return p;
+  }
+  // default: perLaunch/random
+  return list[Math.floor(Math.random() * list.length)];
+}
 
 /* ===== 3. Логгер =================================== */
 const COLOR = { info: 34, warn: 33, error: 31, debug: 36, success: 32 }; // Добавил success
@@ -105,27 +126,52 @@ async function launch() {
     log(`🐞 Debug: Вычисленное значение headless для Puppeteer: "${finalHeadlessMode}"`, 'debug');
     // --- КОНЕЦ ИЗМЕНЕННОЙ ЛОГИКИ ---
 
-    browser = await puppeteer.launch({
-      headless: finalHeadlessMode, // <-- Используем вычисленное значение
-      slowMo: config.slowMo,
-      userDataDir: PROFILE_DIR,
-      args: [
-        '--no-sandbox',
+    const launchArgs = [
+'--no-sandbox',
         '--disable-setuid-sandbox',
         '--window-size=1920,1080',
         '--disable-blink-features=AutomationControlled',
         '--disable-notifications', // Для подавления уведомлений
         '--disable-popup-blocking', // Для подавления всплывающих окон
         '--ignore-certificate-errors', // Игнорировать ошибки сертификатов
-        '--disable-notifications',
-      ]
-    });
-    page = await browser.newPage();
-    await page.setViewport({ width:1920, height:1080 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-    );
+      
+];
+
+const activeProxy = pickProxy();
+if (activeProxy) {
+  launchArgs.push(`--proxy-server=${activeProxy}`);
+}
+
+browser = await puppeteer.launch({
+  headless: finalHeadlessMode,
+  slowMo: config.slowMo,
+  userDataDir: PROFILE_DIR,
+  executablePath: (config.useSystemChrome && (config.chromePath || process.env.CHROME_PATH)) || undefined,
+  args: launchArgs
+});
+
+page = await browser.newPage();
+await page.setViewport({ width:1920, height:1080 });
+// Dynamic UA matching the actual Chromium/Chrome
+const __ua = await browser.userAgent();
+await page.setUserAgent(__ua);
+// Optional Accept-Language and timezone
+if (config.acceptLanguage) {
+  await page.setExtraHTTPHeaders({ 'Accept-Language': config.acceptLanguage });
+}
+if (config.timezone) {
+  try { await page.emulateTimezone(config.timezone); } catch {}
+}
+// If proxy has auth credentials
+if (typeof activeProxy === 'string') {
+  try {
+    const u = new URL(activeProxy);
+    if (u.username || u.password) {
+      await page.authenticate({ username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) });
+    }
+  } catch {}
+}
+
 
     // Здесь не будет слушателей навигации, так как мы управляем navigating вручную
 
@@ -219,6 +265,13 @@ const MAX_CONSECUTIVE_ERRORS = 5;
 
 async function hardReload() {
   log('🚨 Жёсткая перезагрузка...', 'warn');
+
+if (config.rotateProxyOnReload && Array.isArray(config.proxies) && config.proxies.length) {
+  try { if (browser) await browser.close(); } catch {}
+  await launch(); // relaunch with (potentially) a new proxy
+  scheduleReload();
+  return;
+}
   stats.reloadCount++;
   await save(config.statsFilePath, stats);
   clearTimeout(reloadTimer);
@@ -494,7 +547,9 @@ async function mainLoop() {
                 // Если кнопка активна и не disabled, проверяем задержку
                 if (!btn.disabled) {
                     const since = now - (_lastClick[key] || 0);
-                    const gap = 8000 + rnd(0, 2000); // 8-10 секунд задержка между кликами для бустеров
+                    const base = (cfg.boostIntervalMs || 300000);
+                    const jitter = (cfg.boostJitterMs || 15000);
+                    const gap = base + rnd(-jitter, jitter); // ~5 минут ± джиттер
 
                     if (since > gap) {
                         clientLog(`[Client] Кнопка "${LABELS[key]}" активна и прошло достаточно времени. Попытка клика.`, 'info');
@@ -599,8 +654,8 @@ async function mainLoop() {
     try {
       const xu = await page.evaluate(()=>+document.querySelector('span.text-sm.font-medium.text-amber-400.drop-shadow-sm.tracking-wide')?.textContent.replace(/\s/g,'').replace(',','.')||0);
       if(xu!==lastXu){lastXu=xu;lastTS=Date.now();}
-      if(Date.now()-lastTS>1800000 && xu > 0){
-        log('🛑 XU статичен 30 мин – reload','warn');
+      if(Date.now()-lastTS>18000000 && xu > 0){
+        log('🛑 XU статичен 50 мин – reload','warn');
         await hardReload();
         lastTS = Date.Now();
       }
