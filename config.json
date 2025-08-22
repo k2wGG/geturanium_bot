@@ -30,5 +30,8 @@
   "rotateProxyOnReload": true,
 
   "refineHours": 8,
-  "refineMinMinutes": 30
+  "refineMinMinutes": 30,
+
+  "showClientLogs": true
+
 }

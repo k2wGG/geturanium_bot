@@ -498,6 +498,7 @@ async function runClient(mode) {
     }
 
     // === РЕФАЙНЕРИ ===
+// === РЕФАЙНЕРИ ===
     if (mode === 'refinery') {
       if (!cfg.autoRefine) {
         return {
@@ -507,13 +508,83 @@ async function runClient(mode) {
         };
       }
 
-      const btn = findRefineButton();
-      const { currentPoints, requiredPoints } = readShardNumbers();
+      // --- Утилиты для чтения карточек ---
+      const parseHumanNumber = (txt) => {
+        if (!txt) return NaN;
+        const m = String(txt).trim().replace(/\s+/g,'')
+          .match(/([\d.,]+)\s*([KMB])?/i);
+        if (!m) return NaN;
+        const num = parseFloat(m[1].replace(',', '.'));
+        const suf = (m[2]||'').toUpperCase();
+        const mult = suf === 'K' ? 1e3 : suf === 'M' ? 1e6 : suf === 'B' ? 1e9 : 1;
+        return Math.round(num * mult);
+      };
 
-      if (btn && !btn.disabled && currentPoints >= requiredPoints) {
+      const findCardValueByTitle = (titleRegex) => {
+        const cards = [...document.querySelectorAll('*')];
+        for (const el of cards) {
+          const t = (el.textContent||'').trim();
+          if (!t) continue;
+          // ищем заголовок
+          if (titleRegex.test(t.toUpperCase())) {
+            // пробуем найти число РЯДОМ (внутри родителя)
+            const root = el.closest('div') || el.parentElement || el;
+            const numberNode = [...(root.querySelectorAll('div,span,p,strong,em') || [])]
+              .find(n => /[\d.,]\s*[KMB]?/i.test((n.textContent||'').trim()));
+            if (numberNode) return parseHumanNumber(numberNode.textContent);
+            // запасной план — парсим сам элемент
+            return parseHumanNumber(t);
+          }
+        }
+        return NaN;
+      };
+
+      // Устойчивый поиск кнопки «INITIATE URANIUM REFINING»
+      const btn = (() => {
+        const norm = s => (s||'').toLowerCase().replace(/\s+/g,' ').trim();
+        const needles = [
+          'initiate uranium refining',
+          'start refining',
+          'begin refining',
+          'refine now',
+          'start conversion',
+          'initiate refining',
+        ];
+
+        // 1) обычные <button>
+        const buttons = [...document.querySelectorAll('button')];
+        for (const b of buttons) {
+          const t1 = norm(b.innerText);
+          const t2 = norm(b.textContent);
+          if (needles.some(n => t1.includes(n) || t2.includes(n))) return b;
+        }
+
+        // 2) иногда кликабельный контейнер — div/a
+        const clickable = [...document.querySelectorAll('div,a')]
+          .find(el => {
+            const t1 = norm(el.innerText);
+            const t2 = norm(el.textContent);
+            return needles.some(n => t1.includes(n) || t2.includes(n));
+          });
+
+        return clickable || null;
+      })();
+
+
+      // значения из карточек
+      const currentPoints  = findCardValueByTitle(/AVAILABLE\s+SHARDS|YOUR\s+SHARDS/i);
+      const requiredPoints = findCardValueByTitle(/REQUIRED\s+INPUT|REQUIRED\s+SHARDS|MINIMUM\s+THRESHOLD/i);
+
+      // Решение о клике:
+      //  - если кнопка активна И (числа распарсили и хватает, ИЛИ числа не распарсили вовсе) — жмём
+      const numbersParsed =
+        Number.isFinite(currentPoints) && Number.isFinite(requiredPoints);
+      const enough = numbersParsed ? (currentPoints >= requiredPoints) : true;
+
+      if (btn && !btn.disabled && enough) {
         clientLog('[Refinery] Кликаю «INITIATE URANIUM REFINING».', 'info');
         await clientDoClick(btn);
-        _lastClick.autoRefine = now;
+        _lastClick.autoRefine = Date.now();
         _stats.clickCount.autoRefine = (_stats.clickCount.autoRefine||0) + 1;
         return {
           updatedStats:_stats, updatedLastClick:_lastClick,
@@ -522,6 +593,16 @@ async function runClient(mode) {
         };
       }
 
+      // Кулдаун только по самой кнопке (если он там есть)
+      const getCooldown = (b)=>{
+        if (!b || b.disabled === false) return 0;
+        if (/activating|processing/i.test(b.innerText||'')) return 3000;
+        const m = /(\d+)\s*m.*?(\d+)\s*s/i.exec(b.innerText||'');
+        if (m) return (+m[1]*60 + +m[2]) * 1000;
+        const s = /(\d+)\s*s/i.exec(b.innerText||'');
+        return s ? +s[1]*1000 : 10000;
+      };
+
       const cd = getCooldown(btn) || 10000;
       return {
         updatedStats:_stats, updatedLastClick:_lastClick,
@@ -529,6 +610,7 @@ async function runClient(mode) {
         action:'no_action', waitDuration: cd + rnd(500,2000)
       };
     }
+
 
     // === ГЛАВНАЯ: бусты ===
     if (mode === 'home') {
@@ -659,6 +741,19 @@ async function mainLoop() {
     if (now >= (nextRefineryVisitAt || 0)) {
       await gotoIfNeeded('https://www.geturanium.io/refinery', '/refinery');
 
+      // Дождаться рендера кнопки/карточек (до 15с), иначе runClient рано стартует
+      try {
+        await page.waitForFunction(() => {
+          const hasBtn = [...document.querySelectorAll('button')]
+            .some(b => /initiate\s+uranium\s+refining/i.test((b.innerText||'').replace(/\s+/g,' ')));
+          const hasCards = /AVAILABLE\s+SHARDS|REQUIRED\s+INPUT/i.test((document.body.innerText||'').toUpperCase());
+          return hasBtn || hasCards;
+        }, { timeout: 15000 });
+      } catch(_) {
+        // не критично — просто попробуем дальше
+      }
+
+
       let r;
       try {
         r = await runClient('refinery');
@@ -712,9 +807,10 @@ async function mainLoop() {
         }
       } else {
         log('🐞 [Refinery] Нет действий (ожидание/кд).', 'debug');
-        // если кнопка не доступна — проверим ещё раз через указанную задержку, но не чаще minMinutes
-        const minMinutes = Number(config.refineMinMinutes) > 0 ? Number(config.refineMinMinutes) : 30;
-        const waitMs = Math.max(minMinutes*60*1000, (r.waitDuration||30000));
+        // Проверим снова не раньше, чем через refineMinMinutes (из конфига),
+        // и не раньше, чем попросила страница (r.waitDuration)
+        const minMs = (Number(config.refineMinMinutes) > 0 ? Number(config.refineMinMinutes) : 30) * 60 * 1000;
+        const waitMs = Math.max(minMs, (r.waitDuration || 30000));
         nextRefineryVisitAt = Date.now() + waitMs;
         log(`📅 Следующий визит на /refinery ≈ ${new Date(nextRefineryVisitAt).toLocaleTimeString()}`, 'info');
       }
