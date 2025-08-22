@@ -12,9 +12,10 @@
   "author": "k2wGG",
   "license": "MIT",
   "dependencies": {
-    "puppeteer": "^22.0.0",
+    "minimist": "^1.2.8",
+    "puppeteer": "^22.15.0",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.0"
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "devDependencies": {
     "cross-env": "^7.0.3"
